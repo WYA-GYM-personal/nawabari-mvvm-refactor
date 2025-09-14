@@ -111,7 +111,7 @@ struct RunResultModalView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
-            vm.loadRecentRunRecord(with: runRecordVM)
+            vm.loadRecentRunRecord()
         }
         .overlay {
             if vm.showRewardQueue {

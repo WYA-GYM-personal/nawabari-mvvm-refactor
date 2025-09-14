@@ -1,7 +1,6 @@
 import Foundation
 import MapKit
 import CoreLocation
-import HealthKit
 import FirebaseFirestore
 import FirebaseFirestoreSwift
 import FirebaseStorage
@@ -25,93 +24,29 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
     private var lastIntersectionIndex: Int?
     private var startTime: Date?
     private var endTime: Date?
-    private let healthStore = HKHealthStore()
+    
     private let db = Firestore.firestore()
     private let storage = Storage.storage()
-    private weak var mapView: MKMapView?
     private var firestoreListener: ListenerRegistration?
-
+    
     override init() {
         super.init()
         clManager.delegate = self
         clManager.desiredAccuracy = kCLLocationAccuracyBest
         clManager.requestWhenInUseAuthorization()
     }
-
-    private func updateRunRecord(imageURL: String? = nil) {
-        guard let start = startTime else {
-            print("⚠️ 시작 시간이 설정되지 않았습니다")
-            return
-        }
-
-        let coordinatesArray = coordinates.map { [$0.latitude, $0.longitude] }
-        let capturedAreas: [CoordinatePairWithGroup] = polygons.enumerated().flatMap { (index, polygon) in
-            let points = polygon.points()
-            let count = polygon.pointCount
-            return (0..<count).map {
-                let coordinate = points[$0].coordinate
-                return CoordinatePairWithGroup(latitude: coordinate.latitude, longitude: coordinate.longitude, groupId: index + 1)
-            }
-        }
-
-        let newData = RunRecordModel(
-            id: nil,
-            distance: calculateTotalDistance(),
-            startTime: start,
-            endTime: endTime,
-            routeImage: imageURL,
-            coordinates: coordinates.map { CoordinatePair(latitude: $0.latitude, longitude: $0.longitude) },
-            capturedAreas: capturedAreas,
-            capturedAreaValue: 0
-        )
-
-        do {
-            let ref = db.collection("RunRecordModels").document()
-            try ref.setData(from: newData) { error in
-                if let error = error {
-                    print("Firestore 저장 실패: \(error.localizedDescription)")
-                } else {
-                    print("Firestore에 데이터 저장 성공")
-                    DispatchQueue.main.async {
-                        self.runRecord = newData
-                    }
-                }
-            }
-        } catch {
-            print("Firestore 인코딩 실패: \(error.localizedDescription)")
-        }
-    }
-
-    func fetchRunRecordsFromFirestore() {
-        firestoreListener?.remove()
-        
-        firestoreListener = db.collection("RunRecordModels")
-            .order(by: "start_time", descending: true)
-            .addSnapshotListener { [weak self] snapshot, error in
-                guard let self = self else { return }
-                guard let documents = snapshot?.documents else {
-                    print("Firestore에서 데이터 가져오기 실패: \(error?.localizedDescription ?? "No documents")")
-                    return
-                }
-
-                let dataList = documents.compactMap { try? $0.data(as: RunRecordModel.self) }
-                DispatchQueue.main.async {
-                    self.runRecordList = dataList
-                    self.runRecord = dataList.first
-                    self.polylines.removeAll()
-                }
-            }
-    }
-
+    
+    // MARK: - 런닝 중
+    // 시뮬레이션 중일 때 좌표 갱신
     func startSimulation() {
         guard clManager.authorizationStatus == .authorizedWhenInUse || clManager.authorizationStatus == .authorizedAlways else {
             clManager.requestWhenInUseAuthorization()
             return
         }
-//        guard !isSimulating else {
-//            print("🛑 이미 시뮬레이션 중이므로 실행 안 함")
-//            return
-//        }
+        //        guard !isSimulating else {
+        //            print("🛑 이미 시뮬레이션 중이므로 실행 안 함")
+        //            return
+        //        }
         print("🚨 startSimulation() 실행됨")
         
         coordinates.removeAll()
@@ -135,7 +70,7 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
             }
         }
     }
-
+    
     func stopSimulation() {
         isSimulating = false
         endTime = Date()
@@ -144,18 +79,64 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
         self.updateRunRecord()
     }
     
-    func moveToCurrentLocation() {
-        clManager.requestWhenInUseAuthorization()
-        if let currentLocation = clManager.location {
-            print("📍 Current location available: \(currentLocation.coordinate)")
-            updateRegion(coordinate: currentLocation.coordinate)
-            self.currentLocation = currentLocation.coordinate
-        } else {
-            print("⏳ No current location available yet.")
-            clManager.startUpdatingLocation()
+    // 현재 세션의 좌표/폴리곤을 러닝 기록 데이터로 변환하고 Firestore에 저장.
+    func updateRunRecord(imageURL: String? = nil) {
+        guard let start = startTime else {
+            print("⚠️ 시작 시간이 설정되지 않았습니다")
+            return
+        }
+        
+        let coordinatesArray = coordinates.map { [$0.latitude, $0.longitude] }
+        let capturedAreas: [CoordinatePairWithGroup] = polygons.enumerated().flatMap { (index, polygon) in
+            let points = polygon.points()
+            let count = polygon.pointCount
+            return (0..<count).map {
+                let coordinate = points[$0].coordinate
+                return CoordinatePairWithGroup(latitude: coordinate.latitude, longitude: coordinate.longitude, groupId: index + 1)
+            }
+        }
+        
+        let newData = RunRecordModel(
+            id: nil,
+            distance: calculateTotalDistance(),
+            startTime: start,
+            endTime: endTime,
+            routeImage: imageURL,
+            coordinates: coordinates.map { CoordinatePair(latitude: $0.latitude, longitude: $0.longitude) },
+            capturedAreas: capturedAreas,
+            capturedAreaValue: 0
+        )
+        
+        do {
+            let ref = db.collection("RunRecordModels").document()
+            try ref.setData(from: newData) { error in
+                if let error = error {
+                    print("Firestore 저장 실패: \(error.localizedDescription)")
+                } else {
+                    print("Firestore에 데이터 저장 성공")
+                    DispatchQueue.main.async {
+                        self.runRecord = newData
+                    }
+                }
+            }
+        } catch {
+            print("Firestore 인코딩 실패: \(error.localizedDescription)")
         }
     }
     
+    func calculateTotalDistance() -> Double {
+        guard coordinates.count >= 2 else { return 0.0 }
+        
+        var totalDistance: Double = 0.0
+        for i in 0..<coordinates.count - 1 {
+            let start = CLLocation(latitude: coordinates[i].latitude, longitude: coordinates[i].longitude)
+            let end = CLLocation(latitude: coordinates[i + 1].latitude, longitude: coordinates[i + 1].longitude)
+            totalDistance += start.distance(from: end)
+        }
+        return totalDistance
+    }
+    
+    // 좌표 유효성 검사
     private func updateCoordinates(newCoordinate: CLLocationCoordinate2D) {
         guard isValidCoordinate(newCoordinate, lastCoordinate: coordinates.last) else {
             print("좌표 업데이트 무시: \(newCoordinate.latitude), \(newCoordinate.longitude)")
@@ -168,6 +149,44 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
         updateRegion(coordinate: newCoordinate)
     }
     
+    // MARK: - 메인 화면
+    // 서버에서 런닝 기록 가져오기. 딴 땅을 메인뷰에서 띄우기 위함
+    func fetchRunRecordsFromFirestore() {
+        firestoreListener?.remove()
+        
+        firestoreListener = db.collection("RunRecordModels")
+            .order(by: "start_time", descending: true)
+            .addSnapshotListener { [weak self] snapshot, error in
+                guard let self = self else { return }
+                guard let documents = snapshot?.documents else {
+                    print("Firestore에서 데이터 가져오기 실패: \(error?.localizedDescription ?? "No documents")")
+                    return
+                }
+                
+                let dataList = documents.compactMap { try? $0.data(as: RunRecordModel.self) }
+                DispatchQueue.main.async {
+                    self.runRecordList = dataList
+                    self.runRecord = dataList.first
+                    self.polylines.removeAll()
+                }
+            }
+    }
+    
+    // 현재 위치 버튼
+    func moveToCurrentLocation() {
+        clManager.requestWhenInUseAuthorization()
+        if let currentLocation = clManager.location {
+            print("📍 Current location available: \(currentLocation.coordinate)")
+            updateRegion(coordinate: currentLocation.coordinate)
+            self.currentLocation = currentLocation.coordinate
+        } else {
+            print("⏳ No current location available yet.")
+            clManager.startUpdatingLocation()
+        }
+    }
+    
+    // MARK: - 지도 위 땅 그리기
+    // 마지막 교차 인덱스 이후의 좌표들로 최근 Polyline 생성
     private func updateMapOverlays() {
         let startIdx = (lastIntersectionIndex ?? -1) + 1
         guard startIdx + 1 < coordinates.count else { return }
@@ -182,13 +201,7 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
         }
     }
     
-    private func updateRegion(coordinate: CLLocationCoordinate2D) {
-        region = MKCoordinateRegion(
-            center: coordinate,
-            span: MKCoordinateSpan(latitudeDelta: 0.005, longitudeDelta: 0.005)
-        )
-    }
-    
+    // 좌표 수가 4개 이상인 경우, 새로 추가된 선분이 기존 선분과 교차하는지 검사.
     private func checkForPolygon() {
         guard coordinates.count >= 4 else { return }
         
@@ -212,7 +225,7 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
                     line2End: newLineEnd
                 ) {
                     let polygonCoordinates: [CLLocationCoordinate2D] =
-                        [x] + coordinates[(i+1)...(coordinates.count - 2)] + [x]
+                    [x] + coordinates[(i+1)...(coordinates.count - 2)] + [x]
                     let polygon = MKPolygon(coordinates: polygonCoordinates, count: polygonCoordinates.count)
                     polygons.append(polygon)
                     
@@ -271,16 +284,13 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
         return ua >= 0 && ua <= 1 && ub >= 0 && ub <= 1
     }
     
-    func calculateTotalDistance() -> Double {
-        guard coordinates.count >= 2 else { return 0.0 }
-        
-        var totalDistance: Double = 0.0
-        for i in 0..<coordinates.count - 1 {
-            let start = CLLocation(latitude: coordinates[i].latitude, longitude: coordinates[i].longitude)
-            let end = CLLocation(latitude: coordinates[i + 1].latitude, longitude: coordinates[i + 1].longitude)
-            totalDistance += start.distance(from: end)
-        }
-        return totalDistance
+    // MARK: - 지도 위 땅 그리기
+    // 지도의 center를 현재 좌표로 맞춤
+    private func updateRegion(coordinate: CLLocationCoordinate2D) {
+        region = MKCoordinateRegion(
+            center: coordinate,
+            span: MKCoordinateSpan(latitudeDelta: 0.005, longitudeDelta: 0.005)
+        )
     }
     
     func loadCapturedPolygons(from records: [RunRecordModel]) {
@@ -291,8 +301,8 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
             }
             if coords.count >= 3 && coords.allSatisfy({ isValidCoordinate($0) }) {
                 var closedCoords = coords
-                if closedCoords.first?.latitude != closedCoords.last?.latitude || 
-                   closedCoords.first?.longitude != closedCoords.last?.longitude {
+                if closedCoords.first?.latitude != closedCoords.last?.latitude ||
+                    closedCoords.first?.longitude != closedCoords.last?.longitude {
                     closedCoords.append(closedCoords.first!)
                 }
                 let polygon = MKPolygon(coordinates: closedCoords, count: closedCoords.count)
@@ -334,15 +344,18 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
     
     private func isValidCoordinate(_ coordinate: CLLocationCoordinate2D) -> Bool {
         return coordinate.latitude >= -90 && coordinate.latitude <= 90 &&
-               coordinate.longitude >= -180 && coordinate.longitude <= 180
+        coordinate.longitude >= -180 && coordinate.longitude <= 180
     }
     
+    // MARK: - 델리게이트 함수
+    // 권한 확인/위치 추적 시작 트리거
     func locationManager(_ manager: CLLocationManager, didChangeAuthorization status: CLAuthorizationStatus) {
         if status == .authorizedWhenInUse || status == .authorizedAlways {
             clManager.startUpdatingLocation()
         }
     }
     
+    // GPS에서 새로운 위치 값이 들어올 때마다 자동으로 호출
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let location = locations.last else { return }
         
